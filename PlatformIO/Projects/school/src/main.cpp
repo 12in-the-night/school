@@ -1,39 +1,52 @@
 #include <Arduino.h>
-#include "Audio.h"            // Ensure you have the 'ESP32-audioI2S' library installed
-#include <driver/i2s.h>       // Standard ESP32 I2S driver
-#include <math.h>             // Needed for log10 and sqrt calculations
+#include "Audio.h"
+#include <driver/i2s.h>
+#include <math.h>
 
 // --- 1. HARDWARE PIN DEFINITIONS ---
-// Update these to match your specific wiring
 #define I2S_BCLK 27
 #define I2S_LRC  25
 #define I2S_DOUT 33
 
-// LED Pin Assignments
 const int red_led    = 19;
 const int green_led  = 20;
 const int yellow_led = 21;
 
 // --- 2. CALIBRATION & LOGIC ---
-// Increase this offset if your readings are too low compared to a real SPL meter
-const float CALIBRATION_OFFSET = 50.0; 
+const float CALIBRATION_OFFSET = 50.0;
+float smoothed_db = 0.0;
+const float ALPHA = 0.05; // Smoothing factor (0.01 - 0.1)
 
-// --- GLOBAL OBJECTS ---
-Audio audio; 
+Audio audio;
 
-// Function prototypes
-float calculateActualDb(int32_t* buffer, size_t numSamples);
-void processSensorValue(float db_meter);
+// Helper to calculate dB from I2S buffer
+float calculateActualDb(int32_t* buffer, size_t numSamples) {
+    float sum_sq = 0;
+    for (size_t i = 0; i < numSamples; i++) {
+        float sample = (float)buffer[i] / 2147483647.0; // Normalize 32-bit to -1.0 to 1.0
+        sum_sq += sample * sample;
+    }
+    float rms = sqrt(sum_sq / numSamples);
+    return 20.0 * log10(rms) + CALIBRATION_OFFSET;
+}
+
+// Map dB to LEDs
+void processSensorValue(float db) {
+    // Example thresholds: adjust as needed for your environment
+    digitalWrite(green_led,  (db > 40 && db < 70) ? HIGH : LOW);
+    digitalWrite(yellow_led, (db >= 70 && db < 85) ? HIGH : LOW);
+    digitalWrite(red_led,    (db >= 85) ? HIGH : LOW);
+    
+    Serial.printf("dB: %.2f\n", db);
+}
 
 void setup() {
     Serial.begin(115200);
 
-    // Initialize LED pins
     pinMode(red_led, OUTPUT);
     pinMode(green_led, OUTPUT);
     pinMode(yellow_led, OUTPUT);
 
-    // Configure I2S Hardware
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = 44100,
@@ -52,16 +65,28 @@ void setup() {
         .data_in_num = I2S_DOUT
     };
 
-    // Install and start I2S driver
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
 
-    // Audio library initialization
     audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
     audio.setVolume(10);
     
-    Serial.println("System Initialized. Starting Sound Detection...");
+    Serial.println("System Initialized.");
 }
 
 void loop() {
-    audio.loop(); // Process audio data
+    audio.loop();
+
+    int32_t buffer[64];
+    size_t bytes_read;
+    
+    // Read I2S data
+    if (i2s_read(I2S_NUM_0, &buffer, sizeof(buffer), &bytes_read, portMAX_DELAY) == ESP_OK) {
+        float raw_db = calculateActualDb(buffer, bytes_read / 4);
+        
+        // Apply EMA filter
+        smoothed_db = (raw_db * ALPHA) + (smoothed_db * (1.0 - ALPHA));
+        
+        processSensorValue(smoothed_db);
+    }
+}
